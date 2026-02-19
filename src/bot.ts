@@ -1,9 +1,10 @@
+import axios from 'axios';
 import { Telegraf, Context, Markup } from 'telegraf';
 import { config } from './config';
 import { logger } from './utils/logger';
 import { scheduleService, fetchActiveWeek } from './services/schedule.service';
 import { dbService } from './database/db';
-import { formatDay, formatWeek, LEGEND_HEADER } from './utils/format.utils';
+import { formatDay, formatWeek, LEGEND_HEADER, normalizeLessonType } from './utils/format.utils';
 import { splitWeekMessageByDay } from './utils/messageSplitter';
 import { getUkrainianDayAbbr, getTomorrow } from './utils/date.utils';
 import { isAdmin } from './utils/admin.guard';
@@ -13,6 +14,7 @@ import { getCurrentLesson, formatNowMessage, getNextLesson, formatNextMessage } 
 import { toggleReminder } from './services/reminder.service';
 
 import { handleTeacherCommand } from './services/teacher.service';
+import { generateCsv, parseCsv } from './services/linkCsv.service';
 import type { NotificationRepo } from './database/notificationRepo';
 
 // ─── Telegram message size limit ─────────────────────────────────────────────
@@ -119,6 +121,7 @@ export function createBot(deps?: { notificationRepo?: NotificationRepo }): Teleg
             '/tomorrow — розклад на завтра\n' +
             '/week — розклад на тиждень\n' +
             '/fortnight — переглянути та перемикати тижні\n' +
+            '/exportlinks — завантажити CSV з посиланнями\n' +
             '/setlink &lt;назва&gt; &lt;тип&gt; &lt;url&gt; — зберегти посилання\n' +
             '/deletelink &lt;назва&gt; &lt;тип&gt; — видалити посилання\n\n' +
             'Типи: Лекція | Практика | Лаба';
@@ -335,6 +338,88 @@ export function createBot(deps?: { notificationRepo?: NotificationRepo }): Teleg
         }
     });
 
+    // ─── /exportlinks ────────────────────────────────────────────────────────
+    // Available to all users. Sends a pipe-separated CSV of all known lesson
+    // pairs with their current links pre-filled (empty = no link saved).
+    bot.command('exportlinks', async (ctx: Context) => {
+        try {
+            const lessons = await scheduleService.getAllLessons();
+            const links = dbService.getAllLinks();
+            const csv = generateCsv(lessons, links);
+            // BOM prefix so the file opens correctly in Excel / LibreOffice
+            const buffer = Buffer.from('\uFEFF' + csv, 'utf-8');
+            await ctx.replyWithDocument({ source: buffer, filename: 'links.csv' });
+        } catch (err) {
+            logger.error('Error in /exportlinks:', err);
+            await ctx.reply('❌ Не вдалося згенерувати файл. Спробуйте пізніше.');
+        }
+    });
+
+    // ─── /importlinks (via document caption) ─────────────────────────────────
+    // Admin-only. User attaches the filled CSV file with caption "/importlinks"
+    // (or "/importlinks@botname"). Bot downloads the file, parses each row, and
+    // either sets or deletes the link depending on whether the link column is
+    // empty.
+    bot.on('document', async (ctx) => {
+        const caption = ('caption' in ctx.message ? ctx.message.caption : undefined) ?? '';
+        if (!/^\/importlinks(@\w+)?\s*$/i.test(caption.trim())) return;
+
+        if (!isAdmin(ctx)) {
+            logger.warn(
+                `[SECURITY] Unauthorized admin attempt: /importlinks by userId=${ctx.from?.id ?? 'unknown'} username=@${ctx.from?.username ?? 'unknown'}`,
+            );
+            await ctx.reply('У вас немає прав для цієї команди.');
+            return;
+        }
+
+        try {
+            const doc = ctx.message.document;
+            const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+            const { data: csvText } = await axios.get<string>(fileLink.href, {
+                responseType: 'text',
+                timeout: 10_000,
+            });
+
+            const parsed = parseCsv(csvText);
+            if (!parsed.ok) {
+                await ctx.reply(`⚠️ ${parsed.error}`);
+                return;
+            }
+
+            let set = 0;
+            let deleted = 0;
+            let skipped = 0;
+
+            for (const row of parsed.rows) {
+                if (row.link) {
+                    const urlError = validateUrl(row.link);
+                    if (urlError) {
+                        logger.warn(
+                            `[SECURITY] Invalid URL in /importlinks by userId=${ctx.from?.id ?? 'unknown'}: ${row.link}`,
+                        );
+                        skipped++;
+                        continue;
+                    }
+                    dbService.setLink(row.lessonName, row.lessonType, row.link);
+                    set++;
+                } else {
+                    const wasDeleted = dbService.deleteLink(row.lessonName, row.lessonType);
+                    if (wasDeleted) deleted++;
+                }
+            }
+
+            await ctx.reply(
+                `✅ Імпорт завершено:\n` +
+                `• збережено: ${set}\n` +
+                `• видалено: ${deleted}\n` +
+                `• пропущено (некоректний URL): ${skipped}`,
+            );
+        } catch (err) {
+            logger.error('Error in /importlinks:', err);
+            await ctx.reply('❌ Не вдалося обробити файл. Перевірте формат CSV.');
+        }
+    });
+
     // ─── /next ────────────────────────────────────────────────────────
     bot.command('next', async (ctx: Context) => {
         try {
@@ -349,12 +434,7 @@ export function createBot(deps?: { notificationRepo?: NotificationRepo }): Teleg
             }
 
             const { lesson } = next;
-            const dbLabel =
-                lesson.type.startsWith('Лек') ? 'Лекція'
-                    : lesson.type.startsWith('Прак') ? 'Практика'
-                        : lesson.type.startsWith('Лаб') ? 'Лаба'
-                            : lesson.type;
-            const link = dbService.getLink(lesson.name, dbLabel);
+            const link = dbService.getLink(lesson.name, normalizeLessonType(lesson.type));
 
             await ctx.replyWithHTML(formatNextMessage(next, link));
         } catch (err) {
@@ -377,12 +457,7 @@ export function createBot(deps?: { notificationRepo?: NotificationRepo }): Teleg
             }
 
             const { lesson } = active;
-            const dbLabel =
-                lesson.type.startsWith('Лек') ? 'Лекція'
-                    : lesson.type.startsWith('Прак') ? 'Практика'
-                        : lesson.type.startsWith('Лаб') ? 'Лаба'
-                            : lesson.type;
-            const link = dbService.getLink(lesson.name, dbLabel);
+            const link = dbService.getLink(lesson.name, normalizeLessonType(lesson.type));
 
             await ctx.replyWithHTML(formatNowMessage(active, link));
         } catch (err) {
