@@ -23,6 +23,14 @@ function getTypeMeta(type: string): TypeMeta {
     return { icon: '⚪', dbLabel: type };
 }
 
+/**
+ * Converts a raw API lesson type (e.g. "Лек.", "Прак.") to the canonical
+ * DB label ("Лекція", "Практика", "Лаба"). Unknown types are returned as-is.
+ */
+export function normalizeLessonType(rawType: string): string {
+    return getTypeMeta(rawType).dbLabel;
+}
+
 // ─── Legend header ────────────────────────────────────────────────────────────
 
 export const LEGEND_HEADER = 'Група: ІМ-41\n🔵 Лекція 🟠 Практика 🟢 Лаба';
